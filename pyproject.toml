@@ -15,7 +15,7 @@ requires-python = ">=3.9"
 dependencies = ["psycopg[binary]"]
 
 [project.optional-dependencies]
-test = ["pytest", "coverage"]
+test = ["pytest", "coverage", "flake8"]
 build = ["build", "twine"]
 
 [project.urls]
