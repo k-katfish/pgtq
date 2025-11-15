@@ -10,7 +10,7 @@ import select
 import threading
 import time
 from datetime import timedelta
-from typing import Any, Callable, Dict, Generator, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Generator, Optional, Sequence
 from contextlib import contextmanager
 
 import psycopg
@@ -19,6 +19,7 @@ from psycopg import sql
 from .task import Task
 
 Log = Callable[[str], None]
+
 
 class PGTQ:
     """
@@ -29,7 +30,7 @@ class PGTQ:
     - LISTEN/NOTIFY used to wake workers instead of pure polling
 
     Requires psycopg.
-    
+
     Parameters:
         dsn: PostgreSQL DSN for connecting to the database.
         table_name: name of the tasks table (default: "pgtq_tasks").
@@ -59,12 +60,13 @@ class PGTQ:
         self._install_lock = threading.Lock()
 
         if log_fn is None:
+
             def log_fn(msg: str) -> None:
                 # default to silent; user can pass their own logger
                 pass
-        
+
         self.log = log_fn
-        
+
         self._registry = {}
         self._batching = False
 
@@ -76,7 +78,7 @@ class PGTQ:
         """
         Create the tasks table and indexes if they don't exist.
         Safe to call multiple times.
-        """     
+        """
         with self._install_lock:
             with self._conn.cursor() as cur:
                 self.log(f"[pgtq] installing table '{self.table_name}' if not exists.")
@@ -120,7 +122,9 @@ class PGTQ:
                 )
 
                 # Index for requeueing stale in-progress tasks
-                self.log(f"[pgtq] ensuring heartbeat index on table '{self.table_name}'.")
+                self.log(
+                    f"[pgtq] ensuring heartbeat index on table '{self.table_name}'."
+                )
                 cur.execute(
                     sql.SQL(
                         """
@@ -153,7 +157,7 @@ class PGTQ:
 
         Returns the new task id.
         """
-        
+
         if args is None:
             args = {}
 
@@ -181,7 +185,7 @@ class PGTQ:
 
         self.log(f"[pgtq] enqueued task {task_id} ({call})")
         return task_id
-    
+
     @contextmanager
     def batch_enqueue(self):
         """
@@ -196,16 +200,16 @@ class PGTQ:
                 ...
         """
         already_batching = self._batching
-        
+
         self._batching = True
-        
+
         try:
             yield
         finally:
             if not already_batching:
                 self._batching = False
                 self.notify()
-                
+
     def notify(self) -> None:
         """
         Send a NOTIFY to wake up listening workers. You do _not_ need to call
@@ -217,12 +221,9 @@ class PGTQ:
             self._notify_new_tasks(cur)
             self.log(f"[pgtq] sent manual NOTIFY on channel '{self.channel_name}'")
 
-
     def _notify_new_tasks(self, cur: psycopg.extensions.cursor) -> None:
         cur.execute(
-            sql.SQL("NOTIFY {chan};").format(
-                chan=sql.Identifier(self.channel_name)
-            )
+            sql.SQL("NOTIFY {chan};").format(chan=sql.Identifier(self.channel_name))
         )
 
     # ----------------------------------------------------------------------
@@ -302,15 +303,14 @@ class PGTQ:
 
             for task in pgtq.listen(["add_numbers", "multiply_numbers"]):
                 handle(task)
-        """        
+        """
         # Set up LISTEN on the dedicated connection
         with self._listen_conn.cursor() as lcur:
             lcur.execute(
-                sql.SQL("LISTEN {chan};").format(
-                    chan=sql.Identifier(self.channel_name)
-                )
+                sql.SQL("LISTEN {chan};").format(chan=sql.Identifier(self.channel_name))
             )
-        self.log(f"[pgtq] listening on channel '{self.channel_name}' "
+        self.log(
+            f"[pgtq] listening on channel '{self.channel_name}' "
             f"for tasks {acceptable_tasks or 'all'}"
         )
 
@@ -328,7 +328,7 @@ class PGTQ:
             if select.select([self._listen_conn], [], [], idle_poll_interval)[0]:
                 # There is data to read (a NOTIFY)
                 self._listen_conn.pgconn.consume_input()
-                
+
                 while True:
                     notify = self._listen_conn.notifies()
                     if notify is None:
@@ -479,11 +479,11 @@ class PGTQ:
                 self._notify_new_tasks(cur)
 
             return requeued_count
-        
+
     # ----------------------------------------------------------------------
     # supervisor and worker loops
     # ----------------------------------------------------------------------
-    
+
     def run_supervisor_forever(
         self,
         *,
@@ -505,7 +505,9 @@ class PGTQ:
             interval: seconds between supervisor iterations.
             default_grace: time allowed before in-progress tasks are considered stale.
         """
-        self.log(f"[pgtq] supervisor started (interval={interval}s, grace={default_grace}).")
+        self.log(
+            f"[pgtq] supervisor started (interval={interval}s, grace={default_grace})."
+        )
 
         while True:
             try:
@@ -517,7 +519,7 @@ class PGTQ:
                 self.log(f"[pgtq] supervisor error: {e!r}")
             finally:
                 time.sleep(interval)
-                
+
     def start_worker(
         self,
         *,
@@ -533,7 +535,7 @@ class PGTQ:
 
         for task in self.listen(
             acceptable_tasks=self.registered_task_names,
-            idle_poll_interval=idle_poll_interval
+            idle_poll_interval=idle_poll_interval,
         ):
             self.run_task(task)
 
@@ -592,12 +594,12 @@ class PGTQ:
             return func
 
         return decorator
-    
+
     def run_task(self, task: Task) -> None:
         """
         Run a registered task by its Task object.
         """
-        
+
         func = self._registry.get(task.call)
 
         if func is None:
@@ -619,7 +621,7 @@ class PGTQ:
     # ----------------------------------------------------------------------
     # Properties
     # ----------------------------------------------------------------------
-    
+
     @property
     def registered_task_names(self):
         return list(self._registry.keys())

@@ -4,12 +4,21 @@
 """
 Async definitions of PGTQ class
 """
-    
+
 import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+)
 
 import psycopg
 from psycopg.rows import dict_row
@@ -108,7 +117,9 @@ class AsyncPGTQ:
         Safe to call multiple times.
         """
         async with self._conn.cursor() as cur:
-            self.log(f"[pgtq-async] installing table '{self.table_name}' if not exists.")
+            self.log(
+                f"[pgtq-async] installing table '{self.table_name}' if not exists."
+            )
             await cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
@@ -138,7 +149,9 @@ class AsyncPGTQ:
                 """
             )
 
-            self.log(f"[pgtq-async] ensuring heartbeat index on table '{self.table_name}'.")
+            self.log(
+                f"[pgtq-async] ensuring heartbeat index on table '{self.table_name}'."
+            )
             await cur.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS {self.table_name}_status_heartbeat_idx
@@ -311,7 +324,7 @@ class AsyncPGTQ:
         - If none, awaits NOTIFY or timeout.
         - On wake/timeout, tries dequeue again.
         """
-        
+
         if acceptable_tasks is None:
             acceptable_tasks = self.registered_task_names
 
@@ -523,7 +536,9 @@ class AsyncPGTQ:
         """
         func = self._registry.get(task.call)
         if func is None:
-            self.log(f"[pgtq-async] no handler for '{task.call}', failing task {task.id}")
+            self.log(
+                f"[pgtq-async] no handler for '{task.call}', failing task {task.id}"
+            )
             await self.fail(task.id, error="unregistered task", requeue=False)
             return None
 

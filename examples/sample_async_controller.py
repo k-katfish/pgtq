@@ -5,8 +5,10 @@ from pgtq import AsyncPGTQ
 
 DSN = "postgresql://demo:demo@localhost:5432/demo"
 
+
 async def log(msg: str):
     print(f"[async-controller] {msg}")
+
 
 async def main():
     pgtq = await AsyncPGTQ.create(DSN, log_fn=lambda m: print(f"[controller] {m}"))
@@ -19,7 +21,7 @@ async def main():
                 "append_line",
                 args={"filepath": f"/tmp/pgtq_async_demo.txt", "text": f"line {i}"},
                 expected_duration=timedelta(seconds=5),
-                notify=False
+                notify=False,
             )
 
     print("[controller] enqueued tasks. Supervisor starting...")
@@ -29,6 +31,7 @@ async def main():
         interval=4.0,
         default_grace=timedelta(seconds=4),
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

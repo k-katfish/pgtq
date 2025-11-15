@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+
 @dataclass
 class Task:
     id: int
@@ -20,4 +21,3 @@ class Task:
     started_at: Optional[datetime]
     last_heartbeat: Optional[datetime]
     expected_duration: Optional[timedelta]
-    

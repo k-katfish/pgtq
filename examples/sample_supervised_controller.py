@@ -5,8 +5,10 @@ from pgtq import PGTQ
 
 DSN = "postgresql://demo:demo@localhost:5432/demo"
 
+
 def log(msg):
     print(f"[controller] {msg}")
+
 
 pgtq = PGTQ(DSN, log_fn=log)
 pgtq.install()
@@ -25,6 +27,6 @@ log("Enqueued tasks. Supervisor will monitor for failures.")
 
 # Run supervisor forever (or until you Ctrl+C)
 pgtq.run_supervisor_forever(
-    interval=4.0,   # check frequently for stale tasks
+    interval=4.0,  # check frequently for stale tasks
     default_grace=timedelta(seconds=4),
 )

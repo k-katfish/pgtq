@@ -18,7 +18,7 @@ with pgtq.batch_enqueue():
             args={"a": i, "b": i + 3},
             expected_duration=timedelta(minutes=1),
         )
-        
+
 
 with pgtq.batch_enqueue():
     for i in range(1000, 2000):
