@@ -12,7 +12,7 @@ authors = [
     { name = "Kyle Ketchell", email = "kyle.ketchell@pm.me" }
 ]
 requires-python = ">=3.9"
-dependencies = ["psycopg[binary]"]
+dependencies = ["psycopg[binary]>=3.0.0"]
 
 [project.optional-dependencies]
 test = ["pytest", "coverage", "flake8"]
