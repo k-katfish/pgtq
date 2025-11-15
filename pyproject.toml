@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgtq"
-version = "0.2.0"
+version = "0.2.1"
 description = "A lightweight PostgreSQL-backed distributed task queue."
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,6 @@ test = ["pytest", "coverage"]
 build = ["build", "twine"]
 
 [project.urls]
-Homepage = "https://github.com/kkatfish/pgtq"
-Source = "https://github.com/kkatfish/pgtq"
-Issues = "https://github.com/kkatfish/pgtq/issues"
+Homepage = "https://github.com/k-katfish/pgtq"
+Source = "https://github.com/k-katfish/pgtq"
+Issues = "https://github.com/k-katfish/pgtq/issues"
