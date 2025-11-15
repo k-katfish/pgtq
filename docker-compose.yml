@@ -1,0 +1,21 @@
+services:
+  postgresql:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    #volumes:
+    #  - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: "demo"
+      POSTGRES_PASSWORD: "demo"
+      POSTGRES_DB: "demo"
+    ports:
+      - "5432:5432"
+      
+#volumes:
+#  pgdata:
