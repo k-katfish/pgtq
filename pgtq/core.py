@@ -221,7 +221,7 @@ class PGTQ:
             self._notify_new_tasks(cur)
             self.log(f"[pgtq] sent manual NOTIFY on channel '{self.channel_name}'")
 
-    def _notify_new_tasks(self, cur: psycopg.extensions.cursor) -> None:
+    def _notify_new_tasks(self, cur: psycopg.Cursor) -> None:
         cur.execute(
             sql.SQL("NOTIFY {chan};").format(chan=sql.Identifier(self.channel_name))
         )
