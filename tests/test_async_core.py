@@ -115,6 +115,7 @@ def make_task(**overrides):
     data = {
         "id": 1,
         "call": "default",
+        "queue_name": "default",
         "args": {},
         "priority": 0,
         "status": "queued",
@@ -148,7 +149,7 @@ def test_close_logs(async_queue):
 def test_install_executes_schema(async_queue):
     queue, main_conn, _, logs, _ = async_queue
     run(queue.install())
-    assert len(main_conn.executed) == 3
+    assert len(main_conn.executed) == 4
     assert "[pgtq-async] install complete" in logs
 
 
@@ -161,6 +162,9 @@ def test_task_registration_and_duplicates(async_queue):
 
     assert queue.registered_task_names == ["job"]
     assert logs[-1].startswith("[pgtq-async] registered")
+    query, params = queue._conn.executed[-1]
+    assert "INSERT INTO" in str(query)
+    assert params[:3] == ("default", "job", "1.0")
 
     with pytest.raises(ValueError):
         @queue.task("job")
@@ -179,7 +183,8 @@ def test_enqueue_inserts_and_notifies(async_queue):
             expected_duration=timedelta(seconds=2),
         )
     )
-    assert json.loads(main_conn.executed[0][1][1]) == {"x": 1}
+    assert main_conn.executed[0][1][1] == "default"
+    assert json.loads(main_conn.executed[0][1][2]) == {"x": 1}
     assert "NOTIFY" in main_conn.executed[1][0]
     assert any("enqueued task 99" in msg for msg in logs)
 
@@ -217,6 +222,7 @@ def test_dequeue_one_returns_task(async_queue):
     row = {
         "id": 7,
         "call": "job",
+        "queue_name": "default",
         "args": '{"value": 3}',
         "priority": 0,
         "status": "queued",
@@ -236,6 +242,26 @@ def test_dequeue_one_returns_none(async_queue):
     queue, _, _, _, _ = async_queue
     task = run(queue.dequeue_one())
     assert task is None
+
+
+def test_list_registered_tasks(async_queue):
+    queue, main_conn, _, _, _ = async_queue
+    now = datetime.now(timezone.utc)
+    main_conn.queue_result(
+        fetchall=[
+            {
+                "queue_name": "default",
+                "task_name": "job",
+                "version": "3.0",
+                "handler_name": "fn",
+                "registered_at": now,
+            }
+        ]
+    )
+
+    rows = run(queue.list_registered_tasks())
+    assert rows[0]["task_name"] == "job"
+    assert rows[0]["version"] == "3.0"
 
 
 def test_listen_yields_after_notify(async_queue, monkeypatch):

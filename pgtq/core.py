@@ -42,12 +42,16 @@ class PGTQ:
         self,
         dsn: str,
         table_name: str = "pgtq_tasks",
-        channel_name: str = "pgtq_new_tasks",
+        channel_name: Optional[str] = None,
+        queue_name: str = "default",
+        registry_table: str = "pgtq_task_registry",
         log_fn: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.dsn = dsn
         self.table_name = table_name
-        self.channel_name = channel_name
+        self.queue_name = queue_name
+        self.channel_name = channel_name or f"pgtq_new_tasks_{queue_name}"
+        self.registry_table = registry_table
 
         # One connection for DDL/DML
         self._conn = psycopg.connect(dsn)
@@ -88,6 +92,7 @@ class PGTQ:
                         CREATE TABLE IF NOT EXISTS {table} (
                             id BIGSERIAL PRIMARY KEY,
                             call TEXT NOT NULL,
+                            queue_name TEXT NOT NULL DEFAULT 'default',
                             args JSONB NOT NULL DEFAULT '{{}}'::jsonb,
 
                             status TEXT NOT NULL DEFAULT 'queued',
@@ -111,7 +116,7 @@ class PGTQ:
                     sql.SQL(
                         """
                         CREATE INDEX IF NOT EXISTS {idx_status_prio}
-                        ON {table} (status, priority, id);
+                        ON {table} (queue_name, status, priority, id);
                         """
                     ).format(
                         idx_status_prio=sql.Identifier(
@@ -139,6 +144,24 @@ class PGTQ:
                     )
                 )
 
+                self.log(
+                    f"[pgtq] ensuring registry table '{self.registry_table}' exists."
+                )
+                cur.execute(
+                    sql.SQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS {registry} (
+                            queue_name TEXT NOT NULL,
+                            task_name TEXT NOT NULL,
+                            version TEXT NOT NULL DEFAULT '1.0',
+                            handler_name TEXT,
+                            registered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                            PRIMARY KEY (queue_name, task_name)
+                        );
+                        """
+                    ).format(registry=sql.Identifier(self.registry_table))
+                )
+
     # ----------------------------------------------------------------------
     # Enqueue
     # ----------------------------------------------------------------------
@@ -150,6 +173,7 @@ class PGTQ:
         *,
         priority: int = 0,
         expected_duration: Optional[timedelta] = None,
+        queue_name: Optional[str] = None,
         notify: bool = True,
     ) -> int:
         """
@@ -165,13 +189,14 @@ class PGTQ:
             cur.execute(
                 sql.SQL(
                     """
-                    INSERT INTO {table} (call, args, priority, expected_duration)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO {table} (call, queue_name, args, priority, expected_duration)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id;
                     """
                 ).format(table=sql.Identifier(self.table_name)),
                 (
                     call,
+                    queue_name or self.queue_name,
                     json.dumps(args),
                     priority,
                     expected_duration,
@@ -240,8 +265,8 @@ class PGTQ:
         Returns a Task or None if no suitable task is available.
         """
         with self._conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            where_fragments = ["status = 'queued'"]
-            params: list[Any] = []
+            where_fragments = ["status = 'queued'", "queue_name = %s"]
+            params: list[Any] = [self.queue_name]
 
             if acceptable_tasks:
                 where_fragments.append("call = ANY(%s)")
@@ -567,6 +592,7 @@ class PGTQ:
         return Task(
             id=row["id"],
             call=row["call"],
+            queue_name=row.get("queue_name", self.queue_name),
             args=self._parse_json(row["args"]),
             priority=row["priority"],
             status=row["status"],
@@ -580,9 +606,12 @@ class PGTQ:
     # Task registration decorator
     # ----------------------------------------------------------------------
 
-    def task(self, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def task(
+        self, name: str, *, version: str = "1.0"
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """
         Decorator to register a function as a task handler.
+        Also records the handler in the shared registry table for controller use.
         """
 
         def decorator(func):
@@ -590,10 +619,45 @@ class PGTQ:
                 raise ValueError(f"Task '{name}' already registered")
 
             self._registry[name] = func
-            self.log(f"[pgtq] registered task '{name}' → {func.__name__}")
+            self._register_task_in_db(name=name, version=version, handler_name=func.__name__)
+            self.log(
+                f"[pgtq] registered task '{name}' → {func.__name__} on queue '{self.queue_name}'"
+            )
             return func
 
         return decorator
+
+    def _register_task_in_db(self, *, name: str, version: str, handler_name: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {registry} (queue_name, task_name, version, handler_name)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (queue_name, task_name)
+                    DO UPDATE SET
+                        version = EXCLUDED.version,
+                        handler_name = EXCLUDED.handler_name,
+                        registered_at = now();
+                    """
+                ).format(registry=sql.Identifier(self.registry_table)),
+                (self.queue_name, name, version, handler_name),
+            )
+
+    def list_registered_tasks(self) -> Sequence[Dict[str, Any]]:
+        with self._conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    SELECT queue_name, task_name, version, handler_name, registered_at
+                    FROM {registry}
+                    WHERE queue_name = %s
+                    ORDER BY task_name;
+                    """
+                ).format(registry=sql.Identifier(self.registry_table)),
+                (self.queue_name,),
+            )
+            return list(cur.fetchall())
 
     def run_task(self, task: Task) -> None:
         """

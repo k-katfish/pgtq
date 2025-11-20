@@ -58,14 +58,18 @@ class AsyncPGTQ:
         conn: psycopg.AsyncConnection,
         listen_conn: psycopg.AsyncConnection,
         table_name: str = "pgtq_tasks",
-        channel_name: str = "pgtq_new_tasks",
+        channel_name: Optional[str] = None,
+        queue_name: str = "default",
+        registry_table: str = "pgtq_task_registry",
         log_fn: Optional[Log] = None,
     ) -> None:
         self.dsn = dsn
         self._conn = conn
         self._listen_conn = listen_conn
         self.table_name = table_name
-        self.channel_name = channel_name
+        self.queue_name = queue_name
+        self.channel_name = channel_name or f"pgtq_new_tasks_{queue_name}"
+        self.registry_table = registry_table
         self.log: Log = log_fn or (lambda _msg: None)
 
         # registry for task handlers
@@ -82,7 +86,9 @@ class AsyncPGTQ:
         cls,
         dsn: str,
         table_name: str = "pgtq_tasks",
-        channel_name: str = "pgtq_new_tasks",
+        channel_name: Optional[str] = None,
+        queue_name: str = "default",
+        registry_table: str = "pgtq_task_registry",
         log_fn: Optional[Log] = None,
     ) -> "AsyncPGTQ":
         """
@@ -96,6 +102,8 @@ class AsyncPGTQ:
             listen_conn=listen_conn,
             table_name=table_name,
             channel_name=channel_name,
+            queue_name=queue_name,
+            registry_table=registry_table,
             log_fn=log_fn,
         )
 
@@ -125,6 +133,7 @@ class AsyncPGTQ:
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
                     id BIGSERIAL PRIMARY KEY,
                     call TEXT NOT NULL,
+                    queue_name TEXT NOT NULL DEFAULT 'default',
                     args JSONB NOT NULL DEFAULT '{{}}'::jsonb,
 
                     status TEXT NOT NULL DEFAULT 'queued',
@@ -145,7 +154,7 @@ class AsyncPGTQ:
             await cur.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS {self.table_name}_status_priority_id_idx
-                ON {self.table_name} (status, priority, id);
+                ON {self.table_name} (queue_name, status, priority, id);
                 """
             )
 
@@ -159,15 +168,31 @@ class AsyncPGTQ:
                 """
             )
 
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.registry_table} (
+                    queue_name TEXT NOT NULL,
+                    task_name TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '1.0',
+                    handler_name TEXT,
+                    registered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                    PRIMARY KEY (queue_name, task_name)
+                );
+                """
+            )
+
         self.log("[pgtq-async] install complete")
 
     # ------------------------------------------------------------------
     # Task registration
     # ------------------------------------------------------------------
 
-    def task(self, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def task(
+        self, name: str, *, version: str = "1.0"
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """
         Decorator to register a function as a task handler.
+        Also records the handler in the registry table for controller discovery.
         """
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -175,10 +200,56 @@ class AsyncPGTQ:
                 raise ValueError(f"Task '{name}' already registered")
 
             self._registry[name] = func
-            self.log(f"[pgtq-async] registered task '{name}' → {func.__name__}")
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._register_task_in_db(
+                        name=name, version=version, handler_name=func.__name__
+                    )
+                )
+            except RuntimeError:
+                asyncio.run(
+                    self._register_task_in_db(
+                        name=name, version=version, handler_name=func.__name__
+                    )
+                )
+            self.log(
+                f"[pgtq-async] registered task '{name}' → {func.__name__} on queue '{self.queue_name}'"
+            )
             return func
 
         return decorator
+
+    async def _register_task_in_db(
+        self, *, name: str, version: str, handler_name: str
+    ) -> None:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                INSERT INTO {self.registry_table} (queue_name, task_name, version, handler_name)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (queue_name, task_name)
+                DO UPDATE SET
+                    version = EXCLUDED.version,
+                    handler_name = EXCLUDED.handler_name,
+                    registered_at = now();
+                """,
+                (self.queue_name, name, version, handler_name),
+            )
+
+    async def list_registered_tasks(self) -> List[Dict[str, Any]]:
+        async with self._conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT queue_name, task_name, version, handler_name, registered_at
+                FROM {self.registry_table}
+                WHERE queue_name = %s
+                ORDER BY task_name;
+                """,
+                (self.queue_name,),
+            )
+            rows = await cur.fetchall()
+            return list(rows)
 
     @property
     def registered_task_names(self) -> List[str]:
@@ -195,6 +266,7 @@ class AsyncPGTQ:
         *,
         priority: int = 0,
         expected_duration: Optional[timedelta] = None,
+        queue_name: Optional[str] = None,
         notify: bool = True,
     ) -> int:
         """
@@ -208,11 +280,17 @@ class AsyncPGTQ:
         async with self._conn.cursor() as cur:
             await cur.execute(
                 f"""
-                INSERT INTO {self.table_name} (call, args, priority, expected_duration)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO {self.table_name} (call, queue_name, args, priority, expected_duration)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (call, json.dumps(args), priority, expected_duration),
+                (
+                    call,
+                    queue_name or self.queue_name,
+                    json.dumps(args),
+                    priority,
+                    expected_duration,
+                ),
             )
             row = await cur.fetchone()
             task_id = row[0]
@@ -270,8 +348,8 @@ class AsyncPGTQ:
         Atomically claim one queued task using SKIP LOCKED.
         Returns a Task or None.
         """
-        where_fragments = ["status = 'queued'"]
-        params: List[Any] = []
+        where_fragments = ["status = 'queued'", "queue_name = %s"]
+        params: List[Any] = [self.queue_name]
 
         if acceptable_tasks:
             where_fragments.append("call = ANY(%s)")
@@ -584,6 +662,7 @@ class AsyncPGTQ:
         return Task(
             id=row["id"],
             call=row["call"],
+            queue_name=row.get("queue_name", self.queue_name),
             args=self._parse_json(row["args"]),
             priority=row["priority"],
             status=row["status"],
