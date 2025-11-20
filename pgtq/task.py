@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 class Task:
     id: int
     call: str
+    queue_name: str
     args: Dict[str, Any]
     priority: int
     status: str

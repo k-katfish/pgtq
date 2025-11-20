@@ -86,6 +86,7 @@ def make_task(**overrides):
     data = {
         "id": 1,
         "call": "default",
+        "queue_name": "default",
         "args": {},
         "priority": 0,
         "status": "queued",
@@ -109,7 +110,7 @@ def test_install_executes_schema_statements(pgtq_env):
 
     queue.install()
 
-    assert len(conn.executed) == 3
+    assert len(conn.executed) == 4
     assert "CREATE TABLE" in str(conn.executed[0][0])
     assert "CREATE INDEX" in str(conn.executed[1][0])
     assert "CREATE INDEX" in str(conn.executed[2][0])
@@ -131,7 +132,7 @@ def test_enqueue_inserts_row_and_notifies(pgtq_env):
     assert task_id == 42
     assert len(conn.executed) == 2
     _, params = conn.executed[0]
-    assert params == ("run_job", json.dumps(args), 5, expected)
+    assert params == ("run_job", "default", json.dumps(args), 5, expected)
     assert "NOTIFY" in str(conn.executed[1][0])
 
 
@@ -180,7 +181,7 @@ def test_dequeue_one_returns_task_with_parsed_fields(pgtq_env):
     assert task.id == 5
     assert task.args == {"value": 7}
     assert task.expected_duration == timedelta(seconds=3)
-    assert conn.executed[0][1] == [["add"]]
+    assert conn.executed[0][1] == ["default", ["add"]]
 
 
 def test_dequeue_one_returns_none_when_no_rows(pgtq_env):
@@ -323,6 +324,26 @@ def test_requeue_stale_in_progress_no_notify_when_none(pgtq_env):
     assert len(conn.executed) == 1
 
 
+def test_list_registered_tasks(pgtq_env):
+    queue, conn, _, _ = pgtq_env
+    now = datetime.now(timezone.utc)
+    conn.queue_result(
+        fetchall=[
+            {
+                "queue_name": "default",
+                "task_name": "job",
+                "version": "2.0",
+                "handler_name": "handler",
+                "registered_at": now,
+            }
+        ]
+    )
+
+    rows = queue.list_registered_tasks()
+    assert rows[0]["task_name"] == "job"
+    assert rows[0]["version"] == "2.0"
+
+
 def test_task_decorator_registers_once(pgtq_env):
     queue, _, _, _ = pgtq_env
 
@@ -331,6 +352,9 @@ def test_task_decorator_registers_once(pgtq_env):
         return "ok"
 
     assert queue.registered_task_names == ["job"]
+    query, params = queue._conn.executed[-1]
+    assert "INSERT INTO" in str(query)
+    assert params[:3] == ("default", "job", "1.0")
 
     with pytest.raises(ValueError):
         @queue.task("job")
