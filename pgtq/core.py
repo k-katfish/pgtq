@@ -10,8 +10,9 @@ import select
 import threading
 import time
 from datetime import timedelta
-from typing import Any, Callable, Dict, Generator, Optional, Sequence
+from typing import Any, Callable, Dict, Generator, Optional, Sequence, Union
 from contextlib import contextmanager
+from uuid import UUID
 
 import psycopg
 from psycopg import sql
@@ -69,6 +70,7 @@ class PGTQ:
 
         self._registry = {}
         self._batching = False
+        self._batch_batch_id: Optional[UUID] = None
 
     # ----------------------------------------------------------------------
     # Setup / schema helpers
@@ -97,6 +99,7 @@ class PGTQ:
                             started_at TIMESTAMP WITH TIME ZONE,
                             last_heartbeat TIMESTAMP WITH TIME ZONE,
                             expected_duration INTERVAL,
+                            batch_id UUID,
 
                             retry_count INTEGER NOT NULL DEFAULT 0,
                             last_error TEXT
@@ -139,6 +142,37 @@ class PGTQ:
                     )
                 )
 
+                # Ensure batch_id exists for older installations
+                self.log(
+                    f"[pgtq] ensuring batch_id column exists on '{self.table_name}'."
+                )
+                cur.execute(
+                    sql.SQL(
+                        """
+                        ALTER TABLE {table}
+                        ADD COLUMN IF NOT EXISTS batch_id UUID;
+                        """
+                    ).format(table=sql.Identifier(self.table_name))
+                )
+
+                # Index for batch status polling
+                self.log(
+                    f"[pgtq] ensuring batch index on table '{self.table_name}'."
+                )
+                cur.execute(
+                    sql.SQL(
+                        """
+                        CREATE INDEX IF NOT EXISTS {idx_batch_status}
+                        ON {table} (batch_id, status);
+                        """
+                    ).format(
+                        idx_batch_status=sql.Identifier(
+                            f"{self.table_name}_batch_status_idx"
+                        ),
+                        table=sql.Identifier(self.table_name),
+                    )
+                )
+
     # ----------------------------------------------------------------------
     # Enqueue
     # ----------------------------------------------------------------------
@@ -151,6 +185,7 @@ class PGTQ:
         priority: int = 0,
         expected_duration: Optional[timedelta] = None,
         notify: bool = True,
+        batch_id: Optional[UUID] = None,
     ) -> int:
         """
         Add a new task to the queue and optionally NOTIFY workers.
@@ -161,12 +196,14 @@ class PGTQ:
         if args is None:
             args = {}
 
+        effective_batch_id = batch_id if batch_id is not None else self._batch_batch_id
+
         with self._conn.cursor() as cur:
             cur.execute(
                 sql.SQL(
                     """
-                    INSERT INTO {table} (call, args, priority, expected_duration)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO {table} (call, args, priority, expected_duration, batch_id)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id;
                     """
                 ).format(table=sql.Identifier(self.table_name)),
@@ -175,6 +212,7 @@ class PGTQ:
                     json.dumps(args),
                     priority,
                     expected_duration,
+                    effective_batch_id,
                 ),
             )
             task_id = cur.fetchone()[0]
@@ -187,7 +225,7 @@ class PGTQ:
         return task_id
 
     @contextmanager
-    def batch_enqueue(self):
+    def batch_enqueue(self, *, batch_id: Optional[UUID] = None):
         """
         Context manager to batch multiple enqueue calls without notifying
         workers until the end of the block.
@@ -200,15 +238,27 @@ class PGTQ:
                 ...
         """
         already_batching = self._batching
+        previous_batch_id = self._batch_batch_id
+
+        if already_batching:
+            if batch_id is not None and previous_batch_id not in (None, batch_id):
+                raise ValueError("Cannot override batch_id while already batching")
+            effective_batch_id = previous_batch_id
+        else:
+            effective_batch_id = batch_id
 
         self._batching = True
+        self._batch_batch_id = effective_batch_id
 
         try:
             yield
         finally:
             if not already_batching:
                 self._batching = False
+                self._batch_batch_id = None
                 self.notify()
+            else:
+                self._batch_batch_id = previous_batch_id
 
     def notify(self) -> None:
         """
@@ -225,6 +275,52 @@ class PGTQ:
         cur.execute(
             sql.SQL("NOTIFY {chan};").format(chan=sql.Identifier(self.channel_name))
         )
+
+    def wait_for_batch(
+        self,
+        batch_id: Union[UUID, str],
+        *,
+        poll_interval: float = 1.0,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """
+        Block until no queued or in-progress tasks remain for the given batch_id.
+
+        A task is considered finished when it is no longer queued/in_progress
+        (it may have completed, been deleted, or failed).
+        """
+        start = time.monotonic()
+
+        while True:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        """
+                        SELECT COUNT(*)
+                        FROM {table}
+                        WHERE batch_id = %s
+                          AND status IN ('queued', 'in_progress');
+                        """
+                    ).format(table=sql.Identifier(self.table_name)),
+                    (batch_id,),
+                )
+                row = cur.fetchone()
+                remaining = row[0] if row else 0
+
+            if remaining == 0:
+                self.log(f"[pgtq] batch {batch_id} has no pending tasks")
+                return
+
+            elapsed = time.monotonic() - start
+            if timeout is not None and elapsed >= timeout:
+                raise TimeoutError(
+                    f"Batch {batch_id} did not finish within {timeout} seconds"
+                )
+
+            sleep_for = poll_interval
+            if timeout is not None:
+                sleep_for = max(0.0, min(poll_interval, timeout - elapsed))
+            time.sleep(sleep_for)
 
     # ----------------------------------------------------------------------
     # Dequeue / worker-facing API
@@ -269,7 +365,7 @@ class PGTQ:
                 RETURNING
                     t.id, t.call, t.args, t.priority, t.status,
                     t.inserted_at, t.started_at, t.last_heartbeat,
-                    t.expected_duration;
+                    t.expected_duration, t.batch_id;
                 """
             ).format(table=sql.Identifier(self.table_name))
 
@@ -574,6 +670,7 @@ class PGTQ:
             started_at=row.get("started_at"),
             last_heartbeat=row.get("last_heartbeat"),
             expected_duration=self._parse_interval(row.get("expected_duration")),
+            batch_id=row.get("batch_id"),
         )
 
     # ----------------------------------------------------------------------

@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -122,6 +123,7 @@ def make_task(**overrides):
         "started_at": None,
         "last_heartbeat": None,
         "expected_duration": None,
+        "batch_id": None,
     }
     data.update(overrides)
     return Task(**data)
@@ -148,7 +150,7 @@ def test_close_logs(async_queue):
 def test_install_executes_schema(async_queue):
     queue, main_conn, _, logs, _ = async_queue
     run(queue.install())
-    assert len(main_conn.executed) == 3
+    assert len(main_conn.executed) == 5
     assert "[pgtq-async] install complete" in logs
 
 
@@ -180,6 +182,7 @@ def test_enqueue_inserts_and_notifies(async_queue):
         )
     )
     assert json.loads(main_conn.executed[0][1][1]) == {"x": 1}
+    assert main_conn.executed[0][1][-1] is None
     assert "NOTIFY" in main_conn.executed[1][0]
     assert any("enqueued task 99" in msg for msg in logs)
 
@@ -187,6 +190,7 @@ def test_enqueue_inserts_and_notifies(async_queue):
 def test_batch_enqueue_defers_notify(async_queue, monkeypatch):
     queue, main_conn, _, logs, _ = async_queue
     main_conn.queue_result(fetchone=(1,))
+    batch_id = uuid4()
 
     notifications = []
 
@@ -196,12 +200,25 @@ def test_batch_enqueue_defers_notify(async_queue, monkeypatch):
     monkeypatch.setattr(queue, "notify", fake_notify)
 
     async def do_work():
-        async with queue.batch_enqueue():
+        async with queue.batch_enqueue(batch_id=batch_id):
             await queue.enqueue("job")
 
     run(do_work())
     assert notifications == ["sent"]
     assert logs[-1] == "[pgtq-async] batch_enqueue complete, sent NOTIFY"
+    assert main_conn.executed[0][1][-1] == batch_id
+
+
+def test_batch_enqueue_rejects_conflicts(async_queue):
+    queue, _, _, _logs, _ = async_queue
+
+    async def do_work():
+        async with queue.batch_enqueue(batch_id=uuid4()):
+            with pytest.raises(ValueError):
+                async with queue.batch_enqueue(batch_id=uuid4()):
+                    await queue.enqueue("job")
+
+    run(do_work())
 
 
 def test_notify_sends_manual_signal(async_queue):
@@ -224,12 +241,14 @@ def test_dequeue_one_returns_task(async_queue):
         "started_at": now,
         "last_heartbeat": now,
         "expected_duration": timedelta(seconds=5),
+        "batch_id": uuid4(),
     }
     main_conn.queue_result(fetchone=row)
 
     task = run(queue.dequeue_one(["job"]))
     assert task.id == 7
     assert task.args == {"value": 3}
+    assert task.batch_id == row["batch_id"]
 
 
 def test_dequeue_one_returns_none(async_queue):
@@ -298,6 +317,47 @@ def test_listen_handles_timeout(async_queue, monkeypatch):
     assert task.id == 12
     assert calls["timeout"] == 1
     assert any("listening on channel" in msg for msg in logs)
+
+
+def test_wait_for_batch_until_done(async_queue, monkeypatch):
+    queue, main_conn, _, logs, _ = async_queue
+    main_conn.queue_result(fetchone=(2,))
+    main_conn.queue_result(fetchone=(0,))
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(duration):
+        sleeps.append(duration)
+
+    monkeypatch.setattr("pgtq.async_core.asyncio.sleep", fake_sleep)
+
+    run(queue.wait_for_batch("batch-async", poll_interval=0.25))
+
+    assert main_conn.executed[0][1] == ("batch-async",)
+    assert main_conn.executed[1][1] == ("batch-async",)
+    assert sleeps == [0.25]
+    assert any("batch batch-async has no pending tasks" in msg for msg in logs)
+
+
+def test_wait_for_batch_timeout(async_queue, monkeypatch):
+    queue, main_conn, _, _logs, _ = async_queue
+    main_conn.queue_result(fetchone=(1,))
+    main_conn.queue_result(fetchone=(1,))
+    main_conn.queue_result(fetchone=(1,))
+
+    timeline = {"now": 0.0}
+
+    async def fake_sleep(duration):
+        timeline["now"] += duration
+
+    def fake_monotonic():
+        return timeline["now"]
+
+    monkeypatch.setattr("pgtq.async_core.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("pgtq.async_core.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(TimeoutError):
+        run(queue.wait_for_batch("batch-timeout", poll_interval=0.1, timeout=0.2))
 
 
 def test_heartbeat_updates(async_queue):

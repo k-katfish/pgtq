@@ -50,6 +50,30 @@ pgtq.start_worker()
 
 For more detailed examples, see the `examples/` directory in the repository.
 
+## Batching and waiting for completion
+
+You can group tasks together with a `batch_id` (UUID) and wait for them to
+finish before continuing:
+
+```python
+import uuid
+from pgtq import PGTQ
+
+pgtq = PGTQ(dsn="postgresql://user:password@localhost/dbname")
+pgtq.install()
+
+batch_id = uuid.uuid4()
+
+with pgtq.batch_enqueue(batch_id=batch_id):
+    for i in range(10):
+        pgtq.enqueue("add_numbers", args={"a": i, "b": i * 2})
+
+# blocks until no queued/in-progress tasks remain for this batch
+pgtq.wait_for_batch(batch_id)
+```
+
+Async users can call `AsyncPGTQ.wait_for_batch(batch_id)` in the same way.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file

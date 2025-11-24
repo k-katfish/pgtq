@@ -8,6 +8,7 @@ Definitions of Task dataclass
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 
 @dataclass
@@ -21,3 +22,4 @@ class Task:
     started_at: Optional[datetime]
     last_heartbeat: Optional[datetime]
     expected_duration: Optional[timedelta]
+    batch_id: Optional[UUID] = None

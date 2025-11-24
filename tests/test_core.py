@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -93,6 +94,7 @@ def make_task(**overrides):
         "started_at": None,
         "last_heartbeat": None,
         "expected_duration": None,
+        "batch_id": None,
     }
     data.update(overrides)
     return Task(**data)
@@ -109,10 +111,12 @@ def test_install_executes_schema_statements(pgtq_env):
 
     queue.install()
 
-    assert len(conn.executed) == 3
+    assert len(conn.executed) == 5
     assert "CREATE TABLE" in str(conn.executed[0][0])
     assert "CREATE INDEX" in str(conn.executed[1][0])
     assert "CREATE INDEX" in str(conn.executed[2][0])
+    assert "ALTER TABLE" in str(conn.executed[3][0])
+    assert "batch_id" in str(conn.executed[3][0]).lower()
 
 
 def test_enqueue_inserts_row_and_notifies(pgtq_env):
@@ -131,7 +135,7 @@ def test_enqueue_inserts_row_and_notifies(pgtq_env):
     assert task_id == 42
     assert len(conn.executed) == 2
     _, params = conn.executed[0]
-    assert params == ("run_job", json.dumps(args), 5, expected)
+    assert params == ("run_job", json.dumps(args), 5, expected, None)
     assert "NOTIFY" in str(conn.executed[1][0])
 
 
@@ -147,6 +151,28 @@ def test_batch_enqueue_defers_notifications(pgtq_env, monkeypatch):
 
     assert notifications == ["sent"]
     assert len(conn.executed) == 1  # insert only, notify happened via patched method
+
+
+def test_batch_enqueue_sets_batch_id_for_enqueues(pgtq_env):
+    queue, conn, _, _ = pgtq_env
+    conn.queue_result(fetchone=(1,))
+    batch_value = uuid4()
+
+    with queue.batch_enqueue(batch_id=batch_value):
+        queue.enqueue("batched")
+
+    _, params = conn.executed[0]
+    assert params[-1] == batch_value
+
+
+def test_batch_enqueue_rejects_conflicting_batch_id(pgtq_env):
+    queue, conn, _, _ = pgtq_env
+    conn.queue_result(fetchone=(1,))
+
+    with queue.batch_enqueue(batch_id=uuid4()):
+        with pytest.raises(ValueError):
+            with queue.batch_enqueue(batch_id=uuid4()):
+                queue.enqueue("batched")
 
 
 def test_notify_sends_manual_signal(pgtq_env):
@@ -171,6 +197,7 @@ def test_dequeue_one_returns_task_with_parsed_fields(pgtq_env):
         "started_at": now,
         "last_heartbeat": now,
         "expected_duration": timedelta(seconds=3),
+        "batch_id": uuid4(),
     }
     conn.queue_result(fetchone=row)
 
@@ -180,6 +207,7 @@ def test_dequeue_one_returns_task_with_parsed_fields(pgtq_env):
     assert task.id == 5
     assert task.args == {"value": 7}
     assert task.expected_duration == timedelta(seconds=3)
+    assert task.batch_id == row["batch_id"]
     assert conn.executed[0][1] == [["add"]]
 
 
@@ -247,6 +275,43 @@ def test_listen_handles_timeout_without_notify(pgtq_env, monkeypatch):
 
     with pytest.raises(StopListening):
         next(gen)
+
+
+def test_wait_for_batch_polls_until_complete(pgtq_env, monkeypatch):
+    queue, conn, _, logs = pgtq_env
+    conn.queue_result(fetchone=(2,))
+    conn.queue_result(fetchone=(0,))
+
+    sleeps = []
+    monkeypatch.setattr("pgtq.core.time.sleep", lambda duration: sleeps.append(duration))
+
+    queue.wait_for_batch("batch-1", poll_interval=0.5)
+
+    assert conn.executed[0][1] == ("batch-1",)
+    assert conn.executed[1][1] == ("batch-1",)
+    assert sleeps == [0.5]
+    assert any("batch batch-1 has no pending tasks" in msg for msg in logs)
+
+
+def test_wait_for_batch_times_out(pgtq_env, monkeypatch):
+    queue, conn, _, _ = pgtq_env
+    conn.queue_result(fetchone=(1,))
+    conn.queue_result(fetchone=(1,))
+    conn.queue_result(fetchone=(1,))
+
+    timeline = {"now": 0.0}
+
+    def fake_monotonic():
+        return timeline["now"]
+
+    def fake_sleep(duration):
+        timeline["now"] += duration
+
+    monkeypatch.setattr("pgtq.core.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("pgtq.core.time.sleep", fake_sleep)
+
+    with pytest.raises(TimeoutError):
+        queue.wait_for_batch("batch-2", poll_interval=0.25, timeout=0.5)
 
 
 def test_complete_delete_and_mark_done(pgtq_env):

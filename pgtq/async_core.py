@@ -7,6 +7,7 @@ Async definitions of PGTQ class
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import (
@@ -18,7 +19,9 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Union,
 )
+from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
@@ -72,6 +75,7 @@ class AsyncPGTQ:
         self._registry: Dict[str, Callable[..., Any]] = {}
         # batching flag for batch_enqueue()
         self._batching: bool = False
+        self._batch_batch_id: Optional[UUID] = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -134,6 +138,7 @@ class AsyncPGTQ:
                     started_at TIMESTAMP WITH TIME ZONE,
                     last_heartbeat TIMESTAMP WITH TIME ZONE,
                     expected_duration INTERVAL,
+                    batch_id UUID,
 
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT
@@ -156,6 +161,26 @@ class AsyncPGTQ:
                 f"""
                 CREATE INDEX IF NOT EXISTS {self.table_name}_status_heartbeat_idx
                 ON {self.table_name} (status, last_heartbeat);
+                """
+            )
+
+            self.log(
+                f"[pgtq-async] ensuring batch_id column exists on '{self.table_name}'."
+            )
+            await cur.execute(
+                f"""
+                ALTER TABLE {self.table_name}
+                ADD COLUMN IF NOT EXISTS batch_id UUID;
+                """
+            )
+
+            self.log(
+                f"[pgtq-async] ensuring batch index on table '{self.table_name}'."
+            )
+            await cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_batch_status_idx
+                ON {self.table_name} (batch_id, status);
                 """
             )
 
@@ -196,6 +221,7 @@ class AsyncPGTQ:
         priority: int = 0,
         expected_duration: Optional[timedelta] = None,
         notify: bool = True,
+        batch_id: Optional[UUID] = None,
     ) -> int:
         """
         Add a new task to the queue and optionally NOTIFY workers.
@@ -205,14 +231,16 @@ class AsyncPGTQ:
         if args is None:
             args = {}
 
+        effective_batch_id = batch_id if batch_id is not None else self._batch_batch_id
+
         async with self._conn.cursor() as cur:
             await cur.execute(
                 f"""
-                INSERT INTO {self.table_name} (call, args, priority, expected_duration)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO {self.table_name} (call, args, priority, expected_duration, batch_id)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (call, json.dumps(args), priority, expected_duration),
+                (call, json.dumps(args), priority, expected_duration, effective_batch_id),
             )
             row = await cur.fetchone()
             task_id = row[0]
@@ -237,7 +265,9 @@ class AsyncPGTQ:
         self.log(f"[pgtq-async] manual NOTIFY on '{self.channel_name}'")
 
     @asynccontextmanager
-    async def batch_enqueue(self) -> AsyncGenerator[None, None]:
+    async def batch_enqueue(
+        self, *, batch_id: Optional[UUID] = None
+    ) -> AsyncGenerator[None, None]:
         """
         Context manager to batch many enqueue() calls and send a single NOTIFY
         at the end.
@@ -249,14 +279,68 @@ class AsyncPGTQ:
                     await pgtq.enqueue("task", args={...}, notify=False)
         """
         already_batching = self._batching
+        previous_batch_id = self._batch_batch_id
+
+        if already_batching:
+            if batch_id is not None and previous_batch_id not in (None, batch_id):
+                raise ValueError("Cannot override batch_id while already batching")
+            effective_batch_id = previous_batch_id
+        else:
+            effective_batch_id = batch_id
+
         self._batching = True
+        self._batch_batch_id = effective_batch_id
         try:
             yield
         finally:
             if not already_batching:
                 self._batching = False
+                self._batch_batch_id = None
                 await self.notify()
                 self.log("[pgtq-async] batch_enqueue complete, sent NOTIFY")
+            else:
+                self._batch_batch_id = previous_batch_id
+
+    async def wait_for_batch(
+        self,
+        batch_id: Union[UUID, str],
+        *,
+        poll_interval: float = 1.0,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """
+        Block until there are no queued or in-progress tasks for the batch_id.
+        """
+        start = time.monotonic()
+
+        while True:
+            async with self._conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {self.table_name}
+                    WHERE batch_id = %s
+                      AND status IN ('queued', 'in_progress');
+                    """,
+                    (batch_id,),
+                )
+                row = await cur.fetchone()
+                remaining = row[0] if row else 0
+
+            if remaining == 0:
+                self.log(f"[pgtq-async] batch {batch_id} has no pending tasks")
+                return
+
+            elapsed = time.monotonic() - start
+            if timeout is not None and elapsed >= timeout:
+                raise TimeoutError(
+                    f"Batch {batch_id} did not finish within {timeout} seconds"
+                )
+
+            sleep_for = poll_interval
+            if timeout is not None:
+                sleep_for = max(0.0, min(poll_interval, timeout - elapsed))
+            await asyncio.sleep(sleep_for)
 
     # ------------------------------------------------------------------
     # Dequeue / listen
@@ -298,7 +382,7 @@ class AsyncPGTQ:
             RETURNING
                 t.id, t.call, t.args, t.priority, t.status,
                 t.inserted_at, t.started_at, t.last_heartbeat,
-                t.expected_duration;
+                t.expected_duration, t.batch_id;
         """
 
         async with self._conn.cursor(row_factory=dict_row) as cur:
@@ -591,4 +675,5 @@ class AsyncPGTQ:
             started_at=row.get("started_at"),
             last_heartbeat=row.get("last_heartbeat"),
             expected_duration=self._parse_interval(row.get("expected_duration")),
+            batch_id=row.get("batch_id"),
         )
