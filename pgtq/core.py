@@ -311,7 +311,7 @@ class PGTQ:
             )
         self.log(
             f"[pgtq] listening on channel '{self.channel_name}' "
-            f"for tasks {acceptable_tasks or 'all'}"
+            f"for tasks {acceptable_tasks or self.registered_task_names}"
         )
 
         if acceptable_tasks is None:
