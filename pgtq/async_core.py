@@ -174,9 +174,7 @@ class AsyncPGTQ:
                 """
             )
 
-            self.log(
-                f"[pgtq-async] ensuring batch index on table '{self.table_name}'."
-            )
+            self.log(f"[pgtq-async] ensuring batch index on table '{self.table_name}'.")
             await cur.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS {self.table_name}_batch_status_idx
@@ -240,7 +238,13 @@ class AsyncPGTQ:
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (call, json.dumps(args), priority, expected_duration, effective_batch_id),
+                (
+                    call,
+                    json.dumps(args),
+                    priority,
+                    expected_duration,
+                    effective_batch_id,
+                ),
             )
             row = await cur.fetchone()
             task_id = row[0]
@@ -564,6 +568,7 @@ class AsyncPGTQ:
         *,
         interval: float = 60.0,
         default_grace: timedelta = timedelta(minutes=5),
+        log_intervals: bool = False,
     ) -> None:
         """
         Async supervisor loop:
@@ -576,6 +581,9 @@ class AsyncPGTQ:
         )
 
         while True:
+            if log_intervals:
+                self.log(f"[pgtq-async] supervisor sleeping for {interval} seconds...")
+
             try:
                 requeued = await self.requeue_stale_in_progress(
                     default_grace=default_grace

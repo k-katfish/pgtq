@@ -156,9 +156,7 @@ class PGTQ:
                 )
 
                 # Index for batch status polling
-                self.log(
-                    f"[pgtq] ensuring batch index on table '{self.table_name}'."
-                )
+                self.log(f"[pgtq] ensuring batch index on table '{self.table_name}'.")
                 cur.execute(
                     sql.SQL(
                         """
@@ -585,6 +583,7 @@ class PGTQ:
         *,
         interval: float = 60.0,
         default_grace: timedelta = timedelta(minutes=5),
+        log_intervals: bool = False,
     ) -> None:
         """
         Run a simple supervisor loop forever.
@@ -606,6 +605,8 @@ class PGTQ:
         )
 
         while True:
+            if log_intervals:
+                self.log(f"[pgtq] supervisor sleeping for {interval} seconds...")
             try:
                 requeued = self.requeue_stale_in_progress(default_grace=default_grace)
                 if requeued:
