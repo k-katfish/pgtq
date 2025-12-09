@@ -387,6 +387,7 @@ class PGTQ:
         acceptable_tasks: Optional[Sequence[str]] = None,
         *,
         idle_poll_interval: float = 30.0,
+        invert_priority: bool = False,
     ) -> Generator[Task, None, None]:
         """
         Generator that yields tasks indefinitely.
@@ -419,7 +420,7 @@ class PGTQ:
 
         while True:
             # First attempt a dequeue without waiting
-            task = self.dequeue_one(acceptable_tasks)
+            task = self.dequeue_one(acceptable_tasks, invert_priority=invert_priority)
             if task is not None:
                 yield task
                 continue
@@ -627,6 +628,7 @@ class PGTQ:
         self,
         *,
         idle_poll_interval: float = 30.0,
+        invert_priority: bool = False,
     ):
         """
         Start a worker loop that listens for tasks and runs them using the
@@ -639,6 +641,7 @@ class PGTQ:
         for task in self.listen(
             acceptable_tasks=self.registered_task_names,
             idle_poll_interval=idle_poll_interval,
+            invert_priority=invert_priority,
         ):
             self.run_task(task)
 

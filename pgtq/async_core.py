@@ -410,6 +410,7 @@ class AsyncPGTQ:
         acceptable_tasks: Optional[Sequence[str]] = None,
         *,
         idle_poll_interval: float = 30.0,
+        invert_priority: bool = False,
     ) -> AsyncGenerator[Task, None]:
         """
         Async generator that yields tasks indefinitely.
@@ -431,7 +432,10 @@ class AsyncPGTQ:
         )
 
         while True:
-            task = await self.dequeue_one(acceptable_tasks=acceptable_tasks)
+            task = await self.dequeue_one(
+                acceptable_tasks=acceptable_tasks,
+                invert_priority=invert_priority,
+            )
             if task is not None:
                 yield task
                 continue
@@ -605,6 +609,7 @@ class AsyncPGTQ:
         self,
         *,
         idle_poll_interval: float = 30.0,
+        invert_priority: bool = False,
     ) -> None:
         """
         Start an async worker loop that:
@@ -619,6 +624,7 @@ class AsyncPGTQ:
         async for task in self.listen(
             acceptable_tasks=self.registered_task_names,
             idle_poll_interval=idle_poll_interval,
+            invert_priority=invert_priority,
         ):
             await self.run_task(task)
 
