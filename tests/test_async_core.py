@@ -221,6 +221,58 @@ def test_batch_enqueue_rejects_conflicts(async_queue):
     run(do_work())
 
 
+def test_batch_enqueue_is_task_local(async_queue, monkeypatch):
+    queue, main_conn, _, _logs, _ = async_queue
+    batch_value = uuid4()
+
+    notify_calls = []
+    manual_notifies = []
+
+    original_notify_new = queue._notify_new_tasks
+
+    async def wrapped_notify_new(cur):
+        notify_calls.append("notify")
+        return await original_notify_new(cur)
+
+    monkeypatch.setattr(queue, "_notify_new_tasks", wrapped_notify_new)
+
+    async def wrapped_notify():
+        manual_notifies.append("manual")
+        # Do not call through to avoid triggering wrapped _notify_new_tasks
+
+    monkeypatch.setattr(queue, "notify", wrapped_notify)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_batch_enqueue():
+        async with queue.batch_enqueue(batch_id=batch_value):
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=2)
+            main_conn.queue_result(fetchone=(2,))
+            await queue.enqueue("batched-task")
+
+    async def run_regular_enqueue():
+        await asyncio.wait_for(started.wait(), timeout=2)
+        main_conn.queue_result(fetchone=(1,))
+        await queue.enqueue("regular-task")
+        release.set()
+
+    async def run_concurrent():
+        await asyncio.gather(run_batch_enqueue(), run_regular_enqueue())
+
+    run(run_concurrent())
+
+    insert_params = [
+        params for query, params in main_conn.executed if "INSERT INTO" in str(query)
+    ]
+
+    assert notify_calls == ["notify"]
+    assert manual_notifies == ["manual"]
+    assert insert_params[0][-1] is None
+    assert insert_params[1][-1] == batch_value
+
+
 def test_notify_sends_manual_signal(async_queue):
     queue, main_conn, _, logs, _ = async_queue
     run(queue.notify())

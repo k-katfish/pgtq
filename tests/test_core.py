@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -173,6 +174,65 @@ def test_batch_enqueue_rejects_conflicting_batch_id(pgtq_env):
         with pytest.raises(ValueError):
             with queue.batch_enqueue(batch_id=uuid4()):
                 queue.enqueue("batched")
+
+
+def test_batch_enqueue_is_thread_local(pgtq_env, monkeypatch):
+    queue, conn, _, _ = pgtq_env
+    batch_value = uuid4()
+
+    notify_calls = []
+    manual_notifies = []
+
+    original_notify_new = queue._notify_new_tasks
+
+    def wrapped_notify_new(cur):
+        notify_calls.append(threading.current_thread().name)
+        return original_notify_new(cur)
+
+    monkeypatch.setattr(queue, "_notify_new_tasks", wrapped_notify_new)
+
+    def wrapped_notify():
+        manual_notifies.append("manual")
+        # Do not call through to avoid triggering wrapped _notify_new_tasks
+
+    monkeypatch.setattr(queue, "notify", wrapped_notify)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def run_batch_enqueue():
+        with queue.batch_enqueue(batch_id=batch_value):
+            started.set()
+            release.wait(timeout=2)
+            conn.queue_result(fetchone=(2,))
+            queue.enqueue("batched-task")
+
+    def run_regular_enqueue():
+        started.wait(timeout=2)
+        conn.queue_result(fetchone=(1,))
+        queue.enqueue("regular-task")
+        release.set()
+
+    batch_thread = threading.Thread(target=run_batch_enqueue, name="batch-thread")
+    regular_thread = threading.Thread(
+        target=run_regular_enqueue, name="regular-thread"
+    )
+
+    batch_thread.start()
+    regular_thread.start()
+    batch_thread.join(timeout=3)
+    regular_thread.join(timeout=3)
+
+    assert not batch_thread.is_alive() and not regular_thread.is_alive()
+
+    insert_params = [
+        params for query, params in conn.executed if "INSERT INTO" in str(query)
+    ]
+
+    assert notify_calls == ["regular-thread"]
+    assert manual_notifies == ["manual"]
+    assert insert_params[0][-1] is None
+    assert insert_params[1][-1] == batch_value
 
 
 def test_notify_sends_manual_signal(pgtq_env):

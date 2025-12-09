@@ -21,6 +21,8 @@ from .task import Task
 
 Log = Callable[[str], None]
 
+_thread_local = threading.local()
+
 
 class PGTQ:
     """
@@ -69,8 +71,6 @@ class PGTQ:
         self.log = log_fn
 
         self._registry = {}
-        self._batching = False
-        self._batch_batch_id: Optional[UUID] = None
 
     # ----------------------------------------------------------------------
     # Setup / schema helpers
@@ -194,7 +194,12 @@ class PGTQ:
         if args is None:
             args = {}
 
-        effective_batch_id = batch_id if batch_id is not None else self._batch_batch_id
+        batching = getattr(_thread_local, "pgtq_batching", False)
+        effective_batch_id = (
+            batch_id
+            if batch_id is not None
+            else getattr(_thread_local, "pgtq_batch_id", None)
+        )
 
         with self._conn.cursor() as cur:
             cur.execute(
@@ -215,7 +220,7 @@ class PGTQ:
             )
             task_id = cur.fetchone()[0]
 
-            if notify and not self._batching:
+            if notify and not batching:
                 self._notify_new_tasks(cur)
                 self.log(f"[pgtq] sent NOTIFY on channel '{self.channel_name}'")
 
@@ -235,28 +240,24 @@ class PGTQ:
                 pgtq.enqueue(...)
                 ...
         """
-        already_batching = self._batching
-        previous_batch_id = self._batch_batch_id
+        batching = getattr(_thread_local, "pgtq_batching", False)
+        current_id = getattr(_thread_local, "pgtq_batch_id", None)
 
-        if already_batching:
-            if batch_id is not None and previous_batch_id not in (None, batch_id):
+        if batching:
+            if batch_id is not None and current_id not in (None, batch_id):
                 raise ValueError("Cannot override batch_id while already batching")
-            effective_batch_id = previous_batch_id
-        else:
-            effective_batch_id = batch_id
+            yield
+            return
 
-        self._batching = True
-        self._batch_batch_id = effective_batch_id
+        _thread_local.pgtq_batching = True
+        _thread_local.pgtq_batch_id = batch_id
 
         try:
             yield
         finally:
-            if not already_batching:
-                self._batching = False
-                self._batch_batch_id = None
-                self.notify()
-            else:
-                self._batch_batch_id = previous_batch_id
+            _thread_local.pgtq_batching = False
+            _thread_local.pgtq_batch_id = None
+            self.notify()
 
     def notify(self) -> None:
         """

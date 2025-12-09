@@ -9,6 +9,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import (
     Any,
@@ -29,6 +30,9 @@ from psycopg.rows import dict_row
 from .task import Task
 
 Log = Callable[[str], None]
+
+_batching_var = ContextVar("pgtq_async_batching", default=False)
+_batch_id_var = ContextVar("pgtq_async_batch_id", default=None)
 
 
 class AsyncPGTQ:
@@ -73,9 +77,6 @@ class AsyncPGTQ:
 
         # registry for task handlers
         self._registry: Dict[str, Callable[..., Any]] = {}
-        # batching flag for batch_enqueue()
-        self._batching: bool = False
-        self._batch_batch_id: Optional[UUID] = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -229,7 +230,8 @@ class AsyncPGTQ:
         if args is None:
             args = {}
 
-        effective_batch_id = batch_id if batch_id is not None else self._batch_batch_id
+        batching = _batching_var.get()
+        effective_batch_id = batch_id if batch_id is not None else _batch_id_var.get()
 
         async with self._conn.cursor() as cur:
             await cur.execute(
@@ -249,7 +251,7 @@ class AsyncPGTQ:
             row = await cur.fetchone()
             task_id = row[0]
 
-            if notify and not self._batching:
+            if notify and not batching:
                 await self._notify_new_tasks(cur)
                 self.log(f"[pgtq-async] sent NOTIFY for new task {task_id} ({call})")
 
@@ -282,28 +284,25 @@ class AsyncPGTQ:
                 for i in range(1000):
                     await pgtq.enqueue("task", args={...}, notify=False)
         """
-        already_batching = self._batching
-        previous_batch_id = self._batch_batch_id
+        batching = _batching_var.get()
+        current_id = _batch_id_var.get()
 
-        if already_batching:
-            if batch_id is not None and previous_batch_id not in (None, batch_id):
+        if batching:
+            if batch_id is not None and current_id not in (None, batch_id):
                 raise ValueError("Cannot override batch_id while already batching")
-            effective_batch_id = previous_batch_id
-        else:
-            effective_batch_id = batch_id
+            yield
+            return
 
-        self._batching = True
-        self._batch_batch_id = effective_batch_id
+        token_batching = _batching_var.set(True)
+        token_id = _batch_id_var.set(batch_id)
+
         try:
             yield
         finally:
-            if not already_batching:
-                self._batching = False
-                self._batch_batch_id = None
-                await self.notify()
-                self.log("[pgtq-async] batch_enqueue complete, sent NOTIFY")
-            else:
-                self._batch_batch_id = previous_batch_id
+            _batching_var.reset(token_batching)
+            _batch_id_var.reset(token_id)
+            await self.notify()
+            self.log("[pgtq-async] batch_enqueue complete, sent NOTIFY")
 
     async def wait_for_batch(
         self,
