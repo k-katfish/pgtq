@@ -220,6 +220,26 @@ def test_dequeue_one_returns_none_when_no_rows(pgtq_env):
     assert len(conn.executed) == 1
 
 
+def test_dequeue_one_orders_by_desc_priority_by_default(pgtq_env):
+    queue, conn, _, _ = pgtq_env
+    conn.queue_result(fetchone=None)
+
+    queue.dequeue_one()
+
+    executed_sql = str(conn.executed[0][0])
+    assert "ORDER BY priority DESC, id ASC" in executed_sql
+
+
+def test_dequeue_one_can_invert_priority_order(pgtq_env):
+    queue, conn, _, _ = pgtq_env
+    conn.queue_result(fetchone=None)
+
+    queue.dequeue_one(invert_priority=True)
+
+    executed_sql = str(conn.executed[0][0])
+    assert "ORDER BY priority ASC, id ASC" in executed_sql
+
+
 def test_listen_waits_for_notify_then_yields_task(pgtq_env, monkeypatch):
     queue, _, listen_conn, logs = pgtq_env
     listen_conn.notify_queue = ["ping"]
@@ -231,7 +251,7 @@ def test_listen_waits_for_notify_then_yields_task(pgtq_env, monkeypatch):
         ]
     )
 
-    def fake_dequeue(acceptable_tasks=None):
+    def fake_dequeue(acceptable_tasks=None, invert_priority=False):
         return next(dequeue_values)
 
     def fake_select(read_list, *_rest):
@@ -254,7 +274,7 @@ def test_listen_waits_for_notify_then_yields_task(pgtq_env, monkeypatch):
 def test_listen_handles_timeout_without_notify(pgtq_env, monkeypatch):
     queue, _, listen_conn, _ = pgtq_env
 
-    def fake_dequeue(acceptable_tasks=None):
+    def fake_dequeue(acceptable_tasks=None, invert_priority=False):
         return None
 
     calls = {"count": 0}
@@ -502,8 +522,9 @@ def test_start_worker_processes_tasks(pgtq_env):
     def handler():
         return None
 
-    def fake_listen(*, acceptable_tasks, idle_poll_interval):
+    def fake_listen(*, acceptable_tasks, idle_poll_interval, invert_priority):
         assert acceptable_tasks == ["job"]
+        assert invert_priority is False
         yield task
 
     queue.listen = fake_listen

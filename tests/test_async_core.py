@@ -257,6 +257,26 @@ def test_dequeue_one_returns_none(async_queue):
     assert task is None
 
 
+def test_dequeue_one_orders_by_desc_priority_by_default(async_queue):
+    queue, main_conn, _, _, _ = async_queue
+    main_conn.queue_result(fetchone=None)
+
+    run(queue.dequeue_one())
+
+    executed_sql = main_conn.executed[0][0]
+    assert "ORDER BY priority DESC, id ASC" in executed_sql
+
+
+def test_dequeue_one_can_invert_priority(async_queue):
+    queue, main_conn, _, _, _ = async_queue
+    main_conn.queue_result(fetchone=None)
+
+    run(queue.dequeue_one(invert_priority=True))
+
+    executed_sql = main_conn.executed[0][0]
+    assert "ORDER BY priority ASC, id ASC" in executed_sql
+
+
 def test_listen_yields_after_notify(async_queue, monkeypatch):
     queue, _, listen_conn, logs, _ = async_queue
     listen_conn.queue_notification("wake")
@@ -266,7 +286,7 @@ def test_listen_yields_after_notify(async_queue, monkeypatch):
         make_task(id=12, call="job"),
     ]
 
-    async def fake_dequeue(*, acceptable_tasks=None):
+    async def fake_dequeue(*, acceptable_tasks=None, invert_priority=False):
         return tasks.pop(0)
 
     async def fake_wait_for(awaitable, timeout):
@@ -291,7 +311,7 @@ def test_listen_handles_timeout(async_queue, monkeypatch):
     queue, _, listen_conn, logs, _ = async_queue
     tasks = [None, make_task(id=12, call="job")]
 
-    async def fake_dequeue(*, acceptable_tasks=None):
+    async def fake_dequeue(*, acceptable_tasks=None, invert_priority=False):
         return tasks.pop(0)
 
     calls = {"timeout": 0}
@@ -440,8 +460,9 @@ def test_start_worker_processes_tasks(async_queue, monkeypatch):
     async def handler():
         return None
 
-    async def fake_listen(*, acceptable_tasks, idle_poll_interval):
+    async def fake_listen(*, acceptable_tasks, idle_poll_interval, invert_priority):
         for task in tasks:
+            assert invert_priority is False
             yield task
 
     processed = []
