@@ -353,6 +353,7 @@ class AsyncPGTQ:
     async def dequeue_one(
         self,
         acceptable_tasks: Optional[Sequence[str]] = None,
+        invert_priority: bool = False,
     ) -> Optional[Task]:
         """
         Atomically claim one queued task using SKIP LOCKED.
@@ -367,12 +368,17 @@ class AsyncPGTQ:
 
         where_clause = " AND ".join(where_fragments)
 
+        if invert_priority:
+            order_clause = "priority ASC, id ASC"
+        else:
+            order_clause = "priority DESC, id ASC"
+
         query = f"""
             WITH next AS (
                 SELECT id
                 FROM {self.table_name}
                 WHERE {where_clause}
-                ORDER BY priority ASC, id ASC
+                ORDER BY {order_clause}
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
